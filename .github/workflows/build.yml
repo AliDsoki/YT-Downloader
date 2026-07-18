@@ -12,25 +12,23 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up build cache
+      - name: Cache Buildozer files
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.buildozer
-            .buildozer
+          path: ~/.buildozer
           key: buildozer-${{ hashFiles('buildozer.spec') }}
           restore-keys: |
             buildozer-
 
-      - name: Build APK with Buildozer
-        uses: ArtemSBulgakov/buildozer-action@v1
-        id: buildozer
-        with:
-          command: buildozer android debug
-          buildozer_version: stable
+      - name: Build APK inside official Buildozer Docker image
+        run: |
+          docker run --rm \
+            -v "$HOME/.buildozer:/home/user/.buildozer" \
+            -v "$(pwd):/home/user/hostcwd" \
+            kivy/buildozer android debug
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: ytdownloader-debug-apk
-          path: ${{ steps.buildozer.outputs.filename }}
+          path: bin/*.apk
