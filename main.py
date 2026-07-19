@@ -312,12 +312,12 @@ def _trim_log(filepath):
 QUALITY_LABELS = [
     ("audio_low",  "صوت 64k"),
     ("audio_high", "صوت 128k"),
+    ("video_144",  "144p"),
+    ("video_240",  "240p"),
     ("video_360",  "360p"),
     ("video_480",  "480p"),
     ("video_720",  "720p"),
     ("video_1080", "1080p"),
-    ("video_1440", "1440p"),
-    ("video_2160", "4K"),
 ]
 
 
@@ -347,8 +347,8 @@ def analyze_formats(info):
     audio_formats.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0)
 
     height_map = {
-        "video_360": 360, "video_480": 480, "video_720": 720,
-        "video_1080": 1080, "video_1440": 1440, "video_2160": 2160,
+        "video_144": 144, "video_240": 240, "video_360": 360, "video_480": 480,
+        "video_720": 720, "video_1080": 1080,
     }
     video_qualities = {}
     for key, target_h in height_map.items():
@@ -732,12 +732,12 @@ def _default_format(quality_key):
     mapping = {
         "audio_low":  "ba[abr<=64]/ba",
         "audio_high": "ba[abr<=128]/ba",
+        "video_144":  "bv[height<=144]+ba/b[height<=144]",
+        "video_240":  "bv[height<=240]+ba/b[height<=240]",
         "video_360":  "bv[height<=360]+ba/b[height<=360]",
         "video_480":  "bv[height<=480]+ba/b[height<=480]",
         "video_720":  "bv[height<=720]+ba/b[height<=720]",
         "video_1080": "bv[height<=1080]+ba/b[height<=1080]",
-        "video_1440": "bv[height<=1440]+ba/b[height<=1440]",
-        "video_2160": "bv[height<=2160]+ba/b[height<=2160]",
     }
     return mapping.get(quality_key, "bv+ba/b")
 
@@ -1213,7 +1213,7 @@ class YTDownloaderApp(App):
         self.picked_url = ""
         self.video_title = ""
         self.video_thumb = ""
-        self.selected_quality_index = 4  # 720p
+        self.selected_quality_index = 6  # 720p
         self.storage_uri = load_storage_uri()
         self.quality_buttons = []
         self.download_widgets = {}
@@ -1997,7 +1997,10 @@ def main():
 
 if __name__ == "__main__":
     # لو اتشغّل كـ service (من أندرويد)
-    if "--service" in sys.argv or os.environ.get("P4A_SERVICE") == "1":
+    # ملحوظة: python-for-android بيحدد وضع الخدمة عن طريق متغيّر البيئة
+    # PYTHON_SERVICE_ARGUMENT (اللي بيتحط تلقائيًا لما الجافا service يشغّل
+    # الملف ده)، مش عن طريق --service في sys.argv ولا P4A_SERVICE.
+    if "--service" in sys.argv or os.environ.get("PYTHON_SERVICE_ARGUMENT") is not None:
         run_service()
     else:
         main()
