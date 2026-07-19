@@ -339,14 +339,14 @@ def _trim_log(filepath):
 # Quality Labels
 # -------------------------------------------------------------------
 QUALITY_LABELS = [
-    ("audio_low",  "صوت 64k"),
-    ("audio_high", "صوت 128k"),
+    ("audio_low",  "صوت 48k"),
+    ("audio_high", "أعلى صوت"),
+    ("video_144",  "144p"),
+    ("video_240",  "240p"),
     ("video_360",  "360p"),
     ("video_480",  "480p"),
     ("video_720",  "720p"),
     ("video_1080", "1080p"),
-    ("video_1440", "1440p"),
-    ("video_2160", "4K"),
 ]
 
 
@@ -376,8 +376,8 @@ def analyze_formats(info):
     audio_formats.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0)
 
     height_map = {
-        "video_360": 360, "video_480": 480, "video_720": 720,
-        "video_1080": 1080, "video_1440": 1440, "video_2160": 2160,
+        "video_144": 144, "video_240": 240, "video_360": 360,
+        "video_480": 480, "video_720": 720, "video_1080": 1080,
     }
     video_qualities = {}
     for key, target_h in height_map.items():
@@ -788,14 +788,14 @@ def _progress_hook(job_id, d):
 
 def _default_format(quality_key):
     mapping = {
-        "audio_low":  "ba[abr<=64]/ba",
-        "audio_high": "ba[abr<=128]/ba",
+        "audio_low":  "ba[abr<=48]/ba",
+        "audio_high": "ba",
+        "video_144":  "bv[height<=144]+ba/b[height<=144]",
+        "video_240":  "bv[height<=240]+ba/b[height<=240]",
         "video_360":  "bv[height<=360]+ba/b[height<=360]",
         "video_480":  "bv[height<=480]+ba/b[height<=480]",
         "video_720":  "bv[height<=720]+ba/b[height<=720]",
         "video_1080": "bv[height<=1080]+ba/b[height<=1080]",
-        "video_1440": "bv[height<=1440]+ba/b[height<=1440]",
-        "video_2160": "bv[height<=2160]+ba/b[height<=2160]",
     }
     return mapping.get(quality_key, "bv+ba/b")
 
@@ -841,7 +841,7 @@ def _download_single_job(job):
         ydl_opts["postprocessors"] = [{
             "key": "FFmpegExtractAudio",
             "preferredcodec": "mp3",
-            "preferredquality": "64" if quality_key == "audio_low" else "128",
+            "preferredquality": "48" if quality_key == "audio_low" else "0",
         }]
     else:
         ydl_opts["merge_output_format"] = "mp4"
@@ -917,6 +917,7 @@ def _download_single_job(job):
 
 
 def _save_to_saf(src_file, title, playlist_name, storage_uri):
+    """حفظ ملف عبر Android SAF باستخدام ParcelFileDescriptor (طريقة موثوقة)."""
     if platform != "android":
         return ""
     try:
@@ -929,8 +930,8 @@ def _save_to_saf(src_file, title, playlist_name, storage_uri):
         DocumentsContract = autoclass("android.provider.DocumentsContract")
 
         tree_uri = Uri.parse(storage_uri)
-        doc_id = DocumentsContract.getTreeDocumentId(tree_uri)
 
+        # إنشاء مجلد قائمة التشغيل لو موجود
         if playlist_name:
             try:
                 folder_uri = DocumentsContract.createDocument(
@@ -939,35 +940,55 @@ def _save_to_saf(src_file, title, playlist_name, storage_uri):
                 )
                 if folder_uri:
                     tree_uri = folder_uri
-                    doc_id = DocumentsContract.getDocumentId(folder_uri)
             except Exception:
-                pass
+                pass  # المجلد ممكن يكون موجود بالفعل
 
         ext = os.path.splitext(src_file)[1] or ".mp4"
         safe_title = sanitize_name(title)
         mime_type = "video/mp4" if ext in (".mp4", ".mkv", ".webm") else "audio/mpeg"
 
+        # إنشاء الملف
         file_uri = DocumentsContract.createDocument(
             ctx.getContentResolver(), tree_uri, mime_type, safe_title + ext
         )
         if not file_uri:
+            logger.error("Failed to create SAF document")
             return ""
 
-        with open(src_file, "rb") as f_in:
-            os_out = ctx.getContentResolver().openOutputStream(file_uri)
-            try:
-                buf_size = 8192
+        # -----------------------------------------------------------
+        # طريقة موثوقة للكتابة: ParcelFileDescriptor + os.write
+        # (بتجنب مشاكل jnius مع Java OutputStream)
+        # -----------------------------------------------------------
+        pfd = ctx.getContentResolver().openFileDescriptor(file_uri, "w")
+        if not pfd:
+            logger.error("Failed to open ParcelFileDescriptor")
+            return ""
+
+        try:
+            fd = pfd.getFd()  # raw file descriptor (int)
+            file_size = os.path.getsize(src_file)
+            written = 0
+
+            with open(src_file, "rb") as src:
                 while True:
-                    chunk = f_in.read(buf_size)
+                    chunk = src.read(131072)  # 128KB chunks
                     if not chunk:
                         break
-                    ByteArray = autoclass("java.lang.Byte").TYPE
-                    jbuf = (buf_size * ByteArray)(list(chunk))
-                    os_out.write(jbuf, 0, len(chunk))
-            finally:
-                os_out.close()
+                    # os.write بياخد bytes ويرجع عدد الـ bytes المكتوبة
+                    offset = 0
+                    while offset < len(chunk):
+                        n = os.write(fd, chunk[offset:])
+                        if n <= 0:
+                            raise IOError("os.write returned 0")
+                        offset += n
+                        written += n
+
+            logger.info("SAF save: wrote %d / %d bytes", written, file_size)
+        finally:
+            pfd.close()
 
         return file_uri.toString()
+
     except Exception as e:
         logger.error("SAF save failed: %s", e)
         append_error_log(f"SAF save error: {e}")
