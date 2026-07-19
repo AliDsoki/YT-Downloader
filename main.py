@@ -84,13 +84,42 @@ from bidi.algorithm import get_display
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 FONT_PATH = os.path.join(APP_DIR, "assets", "NotoNaskhArabic-SemiBold.ttf")
 
+
+# -------------------------------------------------------------------
+# دالة موحدة لجلب Android context (تشتغل في App و Service)
+# -------------------------------------------------------------------
+def _get_android_context():
+    """جيب Android context (يشتغل في app و service)."""
+    if platform != "android":
+        return None
+    try:
+        from jnius import autoclass
+        # حاول Activity الأول (للتطبيق العادي)
+        try:
+            return autoclass("org.kivy.android.PythonActivity").mActivity.getApplicationContext()
+        except Exception:
+            pass
+        # لو مش activity (يعني service)
+        try:
+            return autoclass("org.kivy.android.PythonService").mService.getApplicationContext()
+        except Exception:
+            pass
+        # Fallback
+        try:
+            return autoclass("android.app.ActivityThread").currentApplication().getApplicationContext()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return None
+
+
 # --- المسارات الأساسية ---
 if platform == "android":
-    try:
-        from jnius import autoclass as _autoclass
-        _ctx = _autoclass("org.kivy.android.PythonActivity").mActivity.getApplicationContext()
+    _ctx = _get_android_context()
+    if _ctx:
         _BASE = _ctx.getFilesDir().getAbsolutePath()
-    except Exception:
+    else:
         _BASE = os.path.join(os.path.expanduser("~"), ".yt_downloader")
 else:
     _BASE = os.path.join(os.path.expanduser("~"), ".yt_downloader")
@@ -312,12 +341,12 @@ def _trim_log(filepath):
 QUALITY_LABELS = [
     ("audio_low",  "صوت 64k"),
     ("audio_high", "صوت 128k"),
-    ("video_144",  "144p"),
-    ("video_240",  "240p"),
     ("video_360",  "360p"),
     ("video_480",  "480p"),
     ("video_720",  "720p"),
     ("video_1080", "1080p"),
+    ("video_1440", "1440p"),
+    ("video_2160", "4K"),
 ]
 
 
@@ -347,8 +376,8 @@ def analyze_formats(info):
     audio_formats.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0)
 
     height_map = {
-        "video_144": 144, "video_240": 240, "video_360": 360, "video_480": 480,
-        "video_720": 720, "video_1080": 1080,
+        "video_360": 360, "video_480": 480, "video_720": 720,
+        "video_1080": 1080, "video_1440": 1440, "video_2160": 2160,
     }
     video_qualities = {}
     for key, target_h in height_map.items():
@@ -605,7 +634,9 @@ def _acquire_wake_lock():
         return
     try:
         from jnius import autoclass
-        ctx = autoclass("org.kivy.android.PythonActivity").mActivity.getApplicationContext()
+        ctx = _get_android_context()
+        if not ctx:
+            return
         PowerManager = autoclass("android.os.PowerManager")
         pm = ctx.getSystemService("power")
         _wake_lock = pm.newWakeLock(
@@ -628,21 +659,47 @@ def _release_wake_lock():
         _wake_lock = None
 
 
+def _create_notification_channel():
+    """إنشاء Notification Channel (مطلوب في Android 8+)."""
+    if platform != "android":
+        return
+    try:
+        from jnius import autoclass
+        Build = autoclass("android.os.Build$VERSION")
+        if Build.SDK_INT >= 26:  # Android 8+
+            ctx = _get_android_context()
+            if not ctx:
+                return
+            NotificationChannel = autoclass("android.app.NotificationChannel")
+            NotificationManager = autoclass("android.app.NotificationManager")
+            channel = NotificationChannel(
+                "yt_downloader_channel",
+                "تحميلات يوتيوب",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            channel.setDescription("إشعارات التحميل في الخلفية")
+            nm = ctx.getSystemService("notification")
+            nm.createNotificationChannel(channel)
+            logger.info("Notification channel created")
+    except Exception as e:
+        logger.warning("Failed to create notification channel: %s", e)
+
+
 def _update_notification(title, text, progress=-1):
     global _notification_started
     if platform != "android":
         return
     try:
         from jnius import autoclass
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
-        activity = PythonActivity.mActivity
-        service = activity.getApplicationContext()
+        ctx = _get_android_context()
+        if not ctx:
+            return
 
         NotificationCompat = autoclass("androidx.core.app.NotificationCompat$Builder")
-        builder = NotificationCompat(service, "yt_downloader_channel")
+        builder = NotificationCompat(ctx, "yt_downloader_channel")
         builder.setContentTitle(title)
         builder.setContentText(text)
-        builder.setSmallIcon(service.getApplicationInfo().icon)
+        builder.setSmallIcon(ctx.getApplicationInfo().icon)
         builder.setOngoing(True)
 
         if 0 <= progress <= 100:
@@ -658,13 +715,14 @@ def _update_notification(title, text, progress=-1):
                 if service_obj:
                     service_obj.startForeground(1, notification)
                     _notification_started = True
-            except Exception:
-                pass
+                    logger.info("Started foreground service")
+            except Exception as e:
+                logger.warning("Failed to start foreground: %s", e)
 
-        nm = service.getSystemService("notification")
+        nm = ctx.getSystemService("notification")
         nm.notify(1, notification)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Notification update failed: %s", e)
 
 
 def _stop_foreground():
@@ -732,12 +790,12 @@ def _default_format(quality_key):
     mapping = {
         "audio_low":  "ba[abr<=64]/ba",
         "audio_high": "ba[abr<=128]/ba",
-        "video_144":  "bv[height<=144]+ba/b[height<=144]",
-        "video_240":  "bv[height<=240]+ba/b[height<=240]",
         "video_360":  "bv[height<=360]+ba/b[height<=360]",
         "video_480":  "bv[height<=480]+ba/b[height<=480]",
         "video_720":  "bv[height<=720]+ba/b[height<=720]",
         "video_1080": "bv[height<=1080]+ba/b[height<=1080]",
+        "video_1440": "bv[height<=1440]+ba/b[height<=1440]",
+        "video_2160": "bv[height<=2160]+ba/b[height<=2160]",
     }
     return mapping.get(quality_key, "bv+ba/b")
 
@@ -863,8 +921,10 @@ def _save_to_saf(src_file, title, playlist_name, storage_uri):
         return ""
     try:
         from jnius import autoclass
-        PythonActivity = autoclass("org.kivy.android.PythonActivity")
-        ctx = PythonActivity.mActivity.getApplicationContext()
+        ctx = _get_android_context()
+        if not ctx:
+            logger.error("Cannot get Android context for SAF save")
+            return ""
         Uri = autoclass("android.net.Uri")
         DocumentsContract = autoclass("android.provider.DocumentsContract")
 
@@ -1005,6 +1065,10 @@ def _process_queue():
 def _service_main_loop():
     """الـ main loop بتاع الخدمة."""
     logger.info("Service started")
+    logger.info("BASE: %s", _BASE)
+    logger.info("Queue file: %s", QUEUE_FILE)
+    logger.info("Queue file exists: %s", os.path.isfile(QUEUE_FILE))
+    
     _acquire_wake_lock()
     _init_executor()
 
@@ -1023,6 +1087,12 @@ def _service_main_loop():
     try:
         while not _shutdown_event.is_set():
             try:
+                # قراءة الـ queue كل مرة
+                queue = read_json(QUEUE_FILE, [])
+                queued_count = sum(1 for j in queue if j.get("status") == "queued")
+                if queued_count > 0:
+                    logger.info("Found %d queued jobs", queued_count)
+                
                 _process_queue()
             except Exception as e:
                 logger.error("Queue error: %s", e)
@@ -1213,7 +1283,7 @@ class YTDownloaderApp(App):
         self.picked_url = ""
         self.video_title = ""
         self.video_thumb = ""
-        self.selected_quality_index = 6  # 720p
+        self.selected_quality_index = 4  # 720p
         self.storage_uri = load_storage_uri()
         self.quality_buttons = []
         self.download_widgets = {}
@@ -1996,11 +2066,34 @@ def main():
 
 
 if __name__ == "__main__":
-    # لو اتشغّل كـ service (من أندرويد)
-    # ملحوظة: python-for-android بيحدد وضع الخدمة عن طريق متغيّر البيئة
-    # PYTHON_SERVICE_ARGUMENT (اللي بيتحط تلقائيًا لما الجافا service يشغّل
-    # الملف ده)، مش عن طريق --service في sys.argv ولا P4A_SERVICE.
-    if "--service" in sys.argv or os.environ.get("PYTHON_SERVICE_ARGUMENT") is not None:
+    # ----------------------------------------------------------------
+    # التمييز بين التطبيق والخدمة:
+    # - التطبيق: PYTHON_SERVICE_ARGUMENT مش موجود
+    # - الخدمة: PYTHON_SERVICE_ARGUMENT موجود (بيتحط تلقائيًا من python-for-android)
+    # ----------------------------------------------------------------
+    is_service = (
+        "PYTHON_SERVICE_ARGUMENT" in os.environ
+        or "--service" in sys.argv
+        or os.environ.get("P4A_SERVICE") == "1"
+    )
+    
+    if is_service:
+        logger.info("=" * 60)
+        logger.info("Starting as SERVICE")
+        logger.info("BASE path: %s", _BASE)
+        logger.info("Queue file: %s", QUEUE_FILE)
+        logger.info("=" * 60)
+        
+        # إنشاء notification channel قبل ما نبدأ
+        _create_notification_channel()
+        
+        # تشغيل الخدمة
         run_service()
     else:
+        logger.info("=" * 60)
+        logger.info("Starting as APP")
+        logger.info("BASE path: %s", _BASE)
+        logger.info("=" * 60)
+        
+        # تشغيل التطبيق
         main()
