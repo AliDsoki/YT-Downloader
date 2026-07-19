@@ -39,34 +39,54 @@ logging.basicConfig(
 logger = logging.getLogger("yt_dl")
 
 # ================================================================
-# Kivy imports
+# Service Detection (قبل أي Kivy import)
 # ================================================================
-from kivy.config import Config
-Config.set("graphics", "fullscreen", "0")
+IS_SERVICE = (
+    "PYTHON_SERVICE_ARGUMENT" in os.environ
+    or "--service" in sys.argv
+    or os.environ.get("P4A_SERVICE") == "1"
+)
 
-from kivy.app import App
-from kivy.lang import Builder
-from kivy.factory import Factory
-from kivy.metrics import dp
-from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.floatlayout import FloatLayout
-from kivy.uix.label import Label
-from kivy.uix.button import Button
-from kivy.uix.behaviors import ToggleButtonBehavior
-from kivy.uix.textinput import TextInput
-from kivy.uix.image import AsyncImage
-from kivy.uix.progressbar import ProgressBar
-from kivy.uix.scrollview import ScrollView
-from kivy.uix.spinner import Spinner
-from kivy.uix.switch import Switch
-from kivy.uix.tabbedpanel import TabbedPanel, TabbedPanelItem
-from kivy.core.clipboard import Clipboard
-from kivy.clock import Clock
-from kivy.utils import platform
-from kivy.properties import ListProperty, StringProperty
+# ================================================================
+# Kivy imports (Lazy - بس لو مش Service)
+# ================================================================
+if not IS_SERVICE:
+    try:
+        from kivy.config import Config
+        Config.set("graphics", "fullscreen", "0")
 
+        from kivy.app import App
+        from kivy.lang import Builder
+        from kivy.factory import Factory
+        from kivy.metrics import dp
+        from kivy.uix.boxlayout import BoxLayout
+        from kivy.uix.floatlayout import FloatLayout
+        from kivy.uix.label import Label
+        from kivy.uix.button import Button
+        from kivy.uix.behaviors import ToggleButtonBehavior
+        from kivy.uix.textinput import TextInput
+        from kivy.uix.image import AsyncImage
+        from kivy.uix.progressbar import ProgressBar
+        from kivy.uix.scrollview import ScrollView
+        from kivy.uix.spinner import Spinner
+        from kivy.uix.switch import Switch
+        from kivy.uix.tabbedpanel import TabbedPanel, TabbedPanelItem
+        from kivy.core.clipboard import Clipboard
+        from kivy.clock import Clock
+        from kivy.utils import platform
+        from kivy.properties import ListProperty, StringProperty
+        
+        logger.info("Kivy imports successful")
+    except Exception as e:
+        logger.error("Kivy imports failed: %s", e)
+        # Fallback: dummy platform
+        platform = "unknown"
+else:
+    logger.info("Service mode - skipping Kivy imports")
+    platform = "android"  # Service always runs on Android
+
+# yt-dlp and Arabic support (متاح في الاتنين)
 from yt_dlp import YoutubeDL
-
 import arabic_reshaper
 from bidi.algorithm import get_display
 
@@ -1643,19 +1663,71 @@ class YTDownloaderApp(App):
         threading.Thread(target=self._analyze, daemon=True).start()
 
     def _analyze(self):
-        Clock.schedule_once(lambda dt: self._set_btn(self.btn_analyze, ar("جاري التحليل...")))
+        """تحليل الرابط (بيتشغل في thread منفصل)."""
+        logger.info("=" * 60)
+        logger.info("Starting analysis...")
+        
         try:
-            url = Clipboard.paste()
+            # تحديث الـ UI
+            Clock.schedule_once(lambda dt: self._set_btn(self.btn_analyze, ar("جاري التحليل...")))
+            
+            # جلب الرابط من الحافظة
+            url = ""
+            try:
+                url = Clipboard.paste()
+                logger.info("Clipboard content: %s", url[:100] if url else "(empty)")
+            except Exception as e:
+                logger.error("Clipboard.paste() failed: %s", e)
+                url = ""
+            
+            # Validation
+            if not url or not url.strip():
+                logger.warning("Clipboard is empty")
+                Clock.schedule_once(lambda dt: self._set_status("الحافظة فارغة - انسخ رابط أولاً"))
+                Clock.schedule_once(lambda dt: self._set_btn(self.btn_analyze, ar("التقط الرابط وحلّل")))
+                return
+            
+            url = url.strip()
+            
+            # فحص بسيط للرابط
+            if not (url.startswith("http://") or url.startswith("https://")):
+                logger.warning("Invalid URL: %s", url[:50])
+                Clock.schedule_once(lambda dt: self._set_status("الرابط مش صالح - لازم يبدأ بـ http"))
+                Clock.schedule_once(lambda dt: self._set_btn(self.btn_analyze, ar("التقط الرابط وحلّل")))
+                return
+            
             self.picked_url = url
-
+            logger.info("Analyzing URL: %s", url[:80])
+            
+            # تحليل الرابط
             probe_opts = {
-                "quiet": True, "no_warnings": True, "cachedir": False,
-                "extract_flat": "in_playlist", "noplaylist": False,
+                "quiet": True, 
+                "no_warnings": True, 
+                "cachedir": False,
+                "extract_flat": "in_playlist", 
+                "noplaylist": False,
+                "socket_timeout": 30,  # timeout 30 ثانية
             }
-            with YoutubeDL(probe_opts) as ydl:
-                probe = ydl.extract_info(url, download=False)
-
+            
+            logger.info("Calling extract_info (probe)...")
+            try:
+                with YoutubeDL(probe_opts) as ydl:
+                    probe = ydl.extract_info(url, download=False)
+                logger.info("extract_info succeeded")
+            except Exception as e:
+                logger.error("extract_info failed: %s", e)
+                raise
+            
+            # فحص النتيجة
+            if not probe:
+                logger.error("probe is None")
+                Clock.schedule_once(lambda dt: self._set_status("فشل تحليل الرابط"))
+                Clock.schedule_once(lambda dt: self._set_btn(self.btn_analyze, ar("التقط الرابط وحلّل")))
+                return
+            
+            # قائمة تشغيل أو فيديو واحد؟
             if probe.get("_type") == "playlist" or "entries" in probe:
+                logger.info("Detected: Playlist")
                 self.is_playlist = True
                 self.playlist_entries = [e for e in (probe.get("entries") or []) if e]
                 self.playlist_title = probe.get("title") or "Playlist"
@@ -1663,19 +1735,41 @@ class YTDownloaderApp(App):
                 thumbs = probe.get("thumbnails") or []
                 self.video_thumb = thumbs[-1].get("url", "") if thumbs else ""
                 self.quality_data = {}
+                logger.info("Playlist: %d videos", len(self.playlist_entries))
             else:
+                logger.info("Detected: Single video")
                 self.is_playlist = False
-                with YoutubeDL({"quiet": True, "no_warnings": True, "cachedir": False, "noplaylist": True}) as y2:
-                    info = y2.extract_info(url, download=False)
+                
+                # تحليل كامل للفيديو
+                logger.info("Calling extract_info (full)...")
+                try:
+                    with YoutubeDL({"quiet": True, "no_warnings": True, "cachedir": False, "noplaylist": True, "socket_timeout": 30}) as y2:
+                        info = y2.extract_info(url, download=False)
+                    logger.info("Full extract succeeded")
+                except Exception as e:
+                    logger.error("Full extract failed: %s", e)
+                    raise
+                
                 self.video_title = info.get("title", "")
                 self.video_thumb = info.get("thumbnail", "")
                 sa, vq = analyze_formats(info)
                 s = read_settings()
                 self.quality_data = pick_best_options(sa, vq, use_low_audio=bool(s.get("pair_low_audio", True)))
-
+                logger.info("Formats analyzed: %d options", len(self.quality_data))
+            
+            # تحديث الـ UI
+            logger.info("Scheduling UI update...")
             Clock.schedule_once(lambda dt: self._on_analyze_done())
+            logger.info("Analysis completed successfully!")
+            
         except Exception as e:
-            Clock.schedule_once(lambda dt: self._set_status(f"خطأ: {str(e)[:80]}"))
+            logger.error("=" * 60)
+            logger.error("ANALYSIS FAILED: %s", e)
+            logger.error("Traceback:", exc_info=True)
+            logger.error("=" * 60)
+            
+            error_msg = str(e)[:100]
+            Clock.schedule_once(lambda dt: self._set_status(f"خطأ: {error_msg}"))
             Clock.schedule_once(lambda dt: self._set_btn(self.btn_analyze, ar("التقط الرابط وحلّل")))
 
     def _on_analyze_done(self):
