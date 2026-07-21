@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-YT Downloader v3.0 - النسخة النهائية المستقرة
-==============================================
-✓ ffmpeg مدمج (ParcelFileDescriptor)
-✓ خدمة خلفية محصّنة (Foreground + Wake Lock)
-✓ Thread Pool + Retry + Progress Smoothing
-✓ واجهة عربية بالكامل (Kivy)
-✓ Lazy Kivy imports (مش بتتنفذ في Service mode)
-✓ _get_android_context() موحد (يشتغل في App و Service)
-✓ Logging مفصل
-✓ Validation شامل
+YT Downloader v3.1 - النسخة النهائية المستقرة (معالجة أخطاء الجودات)
+====================================================================
+التغييرات الأساسية عن v3.0:
+- تبنّي آلية MGV3.py في تحديد الجودات المتاحة (audio/video منفصلين + خريطة ارتفاع).
+- إصلاح خطأ "Requested format not available":
+    * لا نعتمد على format_id الهش وقت التحميل.
+    * نستخدم دائماً selectors مرنة مع fallback (…/best).
+    * نمرّر player_client متعدد + إعادة محاولة.
+- ffmpeg مدمج (ParcelFileDescriptor) للحفظ عبر SAF.
+- خدمة خلفية محصّنة (Foreground + Wake Lock).
+- Thread Pool + Retry + Progress Smoothing.
+- واجهة عربية بالكامل (Kivy) مع Lazy imports.
+- معالجة شاملة للأخطاء لضمان عدم تعطل البرنامج.
 """
 
 import os
@@ -76,7 +79,7 @@ if not IS_SERVICE:
         from kivy.clock import Clock
         from kivy.utils import platform
         from kivy.properties import ListProperty, StringProperty
-        
+
         logger.info("✓ Kivy imports successful")
     except Exception as e:
         logger.error("✗ Kivy imports failed: %s", e)
@@ -87,6 +90,7 @@ else:
 
 # yt-dlp and Arabic support (متاح في الاتنين)
 from yt_dlp import YoutubeDL
+import yt_dlp
 import arabic_reshaper
 from bidi.algorithm import get_display
 
@@ -108,17 +112,14 @@ def _get_android_context():
         return None
     try:
         from jnius import autoclass
-        # حاول Activity الأول (للتطبيق العادي)
         try:
             return autoclass("org.kivy.android.PythonActivity").mActivity.getApplicationContext()
         except Exception:
             pass
-        # لو مش activity (يعني service)
         try:
             return autoclass("org.kivy.android.PythonService").mService.getApplicationContext()
         except Exception:
             pass
-        # Fallback
         try:
             return autoclass("android.app.ActivityThread").currentApplication().getApplicationContext()
         except Exception:
@@ -143,13 +144,13 @@ else:
 
 os.makedirs(_BASE, exist_ok=True)
 
-QUEUE_FILE    = os.path.join(_BASE, "queue.json")
-STATUS_FILE   = os.path.join(_BASE, "status.json")
-CONTROL_FILE  = os.path.join(_BASE, "control.json")
+QUEUE_FILE = os.path.join(_BASE, "queue.json")
+STATUS_FILE = os.path.join(_BASE, "status.json")
+CONTROL_FILE = os.path.join(_BASE, "control.json")
 SETTINGS_FILE = os.path.join(_BASE, "settings.json")
-STORAGE_URI_FILE  = os.path.join(_BASE, "storage_uri.txt")
+STORAGE_URI_FILE = os.path.join(_BASE, "storage_uri.txt")
 DOWNLOAD_LOG_FILE = os.path.join(_BASE, "download.log")
-ERROR_LOG_FILE    = os.path.join(_BASE, "error.log")
+ERROR_LOG_FILE = os.path.join(_BASE, "error.log")
 
 logger.info("Queue file: %s", QUEUE_FILE)
 logger.info("Queue exists: %s", os.path.isfile(QUEUE_FILE))
@@ -162,10 +163,10 @@ def ar(text):
     if not text:
         return ""
     try:
-        reshaped = arabic_reshaper.reshape(text)
+        reshaped = arabic_reshaper.reshape(str(text))
         return get_display(reshaped)
     except Exception:
-        return text
+        return str(text)
 
 
 def fit_label(label):
@@ -240,7 +241,7 @@ def read_settings():
     now = time.monotonic()
     if _settings_cache is not None and (now - _settings_cache_time) < 2.0:
         return dict(_settings_cache)
-    data = read_json(SETTINGS_FILE, {"max_concurrent": 2, "pair_low_audio": True})
+    data = read_json(SETTINGS_FILE, {"max_concurrent": 2, "pair_low_audio": True, "use_cookies": False})
     _settings_cache = dict(data)
     _settings_cache_time = now
     return dict(data)
@@ -275,13 +276,12 @@ def save_storage_uri(uri):
 
 
 # -------------------------------------------------------------------
-# Logging
+# Logging (سجل التحميل والأخطاء)
 # -------------------------------------------------------------------
 _log_locks = {
     DOWNLOAD_LOG_FILE: threading.Lock(),
     ERROR_LOG_FILE: threading.Lock(),
 }
-MAX_LOG_SIZE = 200 * 1024
 
 
 def read_log(filepath):
@@ -332,106 +332,220 @@ def clear_log(filepath):
             pass
 
 
-# -------------------------------------------------------------------
-# Quality Labels (الجودات المطلوبة)
-# -------------------------------------------------------------------
+# ================================================================
+# نظام تحديد الجودات (مستوحى من MGV3.py)
+# ================================================================
+
+# الجودات الثمانية المعروضة في الواجهة
 QUALITY_LABELS = [
-    ("audio_low",  "صوت 48k"),
+    ("audio_low", "صوت منخفض"),
     ("audio_high", "أعلى صوت"),
-    ("video_144",  "144p"),
-    ("video_240",  "240p"),
-    ("video_360",  "360p"),
-    ("video_480",  "480p"),
-    ("video_720",  "720p"),
+    ("video_144", "144p"),
+    ("video_240", "240p"),
+    ("video_360", "360p"),
+    ("video_480", "480p"),
+    ("video_720", "720p"),
     ("video_1080", "1080p"),
 ]
 
+# ارتفاعات الفيديو المستهدفة
+_VIDEO_HEIGHTS = {
+    "video_144": 144,
+    "video_240": 240,
+    "video_360": 360,
+    "video_480": 480,
+    "video_720": 720,
+    "video_1080": 1080,
+}
+
+# عملاء yt-dlp بالترتيب (مثل InnerTube في MGV3) لتفادي أخطاء التوقيع/الفورمات
+_PLAYER_CLIENTS = ["ios", "android", "tv", "web"]
+
 
 def _fmt_mb(size_bytes):
+    """تنسيق الحجم بالميجابايت كسلسلة نصية مقروءة."""
     if not size_bytes:
         return "?"
-    mb = size_bytes / (1024 * 1024)
-    return f"{mb:.0f}" if mb >= 100 else f"{mb:.1f}" if mb >= 10 else f"{mb:.2f}"
+    try:
+        mb = float(size_bytes) / (1024 * 1024)
+    except (TypeError, ValueError):
+        return "?"
+    if mb >= 100:
+        return f"{mb:.0f}"
+    if mb >= 10:
+        return f"{mb:.1f}"
+    return f"{mb:.2f}"
+
+
+def _fmt_size_val(f, duration=0):
+    """
+    حساب الحجم التقريبي لفورمات واحد (على غرار information_force في MGV3).
+    يُرجع الحجم بالبايت.
+    """
+    fs = f.get("filesize") or f.get("filesize_approx")
+    if fs:
+        return int(fs)
+    tbr = f.get("tbr")
+    if tbr and duration:
+        return int((tbr * 1000 / 8) * duration)
+    abr = f.get("abr") or 0
+    vbr = f.get("vbr") or 0
+    if (abr or vbr) and duration:
+        return int(((abr + vbr) * 1000 / 8) * duration)
+    return 0
+
+
+def _has_codec(codec_val):
+    """التحقق من وجود codec صالح (None / '' / 'none' / 'null' تعتبر غير موجودة)."""
+    if not codec_val:
+        return False
+    return str(codec_val).strip().lower() not in ("", "none", "null")
 
 
 def analyze_formats(info):
+    """
+    تحليل الفورماتات المتاحة على غرار MGV3.py.
+    يُرجع:
+      sorted_audio: قائمة (format_id, abr, filesize) مرتبة تصاعدياً حسب abr.
+      video_qualities: dict {quality_key: {"height": h, "size": bytes, "fid": id}}
+                       مع اختيار أصغر نسخة (low) لكل ارتفاع.
+      video_qualities_high: مثله لكن أكبر نسخة (high) لكل ارتفاع.
+    """
     formats = info.get("formats") or []
+    duration = info.get("duration") or 0
+
     audio_formats = []
-    video_formats = []
+    video_only = []  # فيديو بدون صوت
 
     for f in formats:
-        vcodec = f.get("vcodec", "none")
-        acodec = f.get("acodec", "none")
-        has_video = vcodec and vcodec != "none"
-        has_audio = acodec and acodec != "none"
-        if has_audio and not has_video:
+        # نتجاهل الـ storyboards والصيغ الغريبة
+        if f.get("vcodec") is None and f.get("acodec") is None:
+            continue
+        has_v = _has_codec(f.get("vcodec"))
+        has_a = _has_codec(f.get("acodec"))
+
+        if has_a and not has_v:
             audio_formats.append(f)
-        elif has_video:
-            video_formats.append(f)
+        elif has_v and not has_a:
+            video_only.append(f)
+        # نتجاهل الفورماتات المدمجة (has_v and has_a) لأننا ندمج يدوياً
 
-    audio_formats.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0)
-
-    height_map = {
-        "video_144": 144, "video_240": 240, "video_360": 360,
-        "video_480": 480, "video_720": 720, "video_1080": 1080,
-    }
-    video_qualities = {}
-    for key, target_h in height_map.items():
-        candidates = [
-            f for f in video_formats
-            if target_h - 100 <= (f.get("height") or 0) <= target_h + 30
-        ]
-        if not candidates:
-            candidates = sorted(video_formats, key=lambda f: abs((f.get("height") or 0) - target_h))[:1]
-        if candidates:
-            best = min(candidates, key=lambda f: f.get("filesize") or f.get("filesize_approx") or float("inf"))
-            fid = best.get("format_id", "")
-            fsize = best.get("filesize") or best.get("filesize_approx") or 0
-            video_qualities[key] = (fid, fsize)
+    # ترتيب الصوت تصاعدياً حسب abr
+    audio_formats.sort(key=lambda f: (f.get("abr") or f.get("tbr") or 0))
 
     sorted_audio = []
     for af in audio_formats:
         fid = af.get("format_id", "")
         abr = af.get("abr") or af.get("tbr") or 0
-        fsize = af.get("filesize") or af.get("filesize_approx") or 0
+        fsize = _fmt_size_val(af, duration)
         sorted_audio.append((fid, abr, fsize))
 
-    return sorted_audio, video_qualities
+    # بناء خرائط الفيديو (low / high) لكل ارتفاع مطلوب
+    video_qualities = {}
+    video_qualities_high = {}
 
-
-def pick_best_options(sorted_audio, video_qualities, use_low_audio=True):
-    options = {}
-    if sorted_audio:
-        low = sorted_audio[0]
-        options["audio_low"] = (
-            f"ba[format_id={low[0]}]" if low[0] else "ba[abr<=48]/ba",
-            _fmt_mb(low[2])
-        )
-        high = sorted_audio[-1]
-        options["audio_high"] = (
-            f"ba[format_id={high[0]}]" if high[0] else "ba",
-            _fmt_mb(high[2])
-        )
-
-    for key, (fid, fsize) in video_qualities.items():
-        if not fid:
+    for key, target_h in _VIDEO_HEIGHTS.items():
+        # المرشحون: كل فيديو ارتفاعه ضمن نطاق حول الارتفاع المستهدف
+        candidates = [
+            f for f in video_only
+            if target_h - 60 <= (f.get("height") or 0) <= target_h + 30
+        ]
+        if not candidates:
             continue
-        if use_low_audio and sorted_audio:
-            audio_fid = sorted_audio[0][0]
-            selector = f"bv[format_id={fid}]+ba[format_id={audio_fid}]" if audio_fid else f"bv[format_id={fid}]+ba"
-        else:
-            selector = f"bv[format_id={fid}]+ba" if sorted_audio else f"bv[format_id={fid}]"
-        options[key] = (selector, _fmt_mb(fsize))
-    return options
+
+        # low = أصغر حجم / high = أكبر حجم لنفس الارتفاع
+        def _size_key(f):
+            s = _fmt_size_val(f, duration)
+            return s if s > 0 else float("inf")
+
+        low = min(candidates, key=_size_key)
+        high = max(candidates, key=lambda f: _fmt_size_val(f, duration))
+
+        video_qualities[key] = {
+            "height": low.get("height") or target_h,
+            "size": _fmt_size_val(low, duration),
+            "fid": low.get("format_id", ""),
+        }
+        video_qualities_high[key] = {
+            "height": high.get("height") or target_h,
+            "size": _fmt_size_val(high, duration),
+            "fid": high.get("format_id", ""),
+        }
+
+    return sorted_audio, video_qualities, video_qualities_high
+
+
+def build_format_selector(quality_key, sorted_audio, video_map, use_low_audio=True):
+    """
+    بناء selector مرن مع fallback (الحل الأساسي لخطأ Requested format not available).
+
+    الفكرة المستوحاة من MGV3 + نصيحة yt-dlp:
+    - لا نعتمد على format_id ثابت وحده لأنه قد يفشل وقت التحميل.
+    - نستخدم القيود على الارتفاع/abr التي تبقى صالحة بين الجلسات.
+    - نضيف دائماً سلسلة fallback تنتهي بـ 'best' حتى لا يفشل التحميل أبداً.
+
+    يُرجع (format_selector_string, size_bytes)
+    """
+    if quality_key == "audio_low":
+        size = sorted_audio[0][2] if sorted_audio else 0
+        # أقل صوت متاح ثم أي صوت ثم أفضل صوت
+        selector = "worstaudio/bestaudio[abr<=64]/bestaudio/ba"
+        return selector, size
+
+    if quality_key == "audio_high":
+        size = sorted_audio[-1][2] if sorted_audio else 0
+        selector = "bestaudio/ba/best"
+        return selector, size
+
+    # جودة فيديو
+    info = video_map.get(quality_key)
+    h = _VIDEO_HEIGHTS.get(quality_key, 720)
+    if info and info.get("height"):
+        h = info["height"]
+
+    v_size = info["size"] if info else 0
+    a_size = 0
+    if sorted_audio:
+        a_size = sorted_audio[0][2] if use_low_audio else sorted_audio[-1][2]
+    total = (v_size or 0) + (a_size or 0)
+
+    # اختيار الصوت المرافق (قيد مرن بدل format_id)
+    if use_low_audio:
+        audio_part = "worstaudio/bestaudio[abr<=64]/bestaudio"
+    else:
+        audio_part = "bestaudio"
+
+    # selector مرن متعدد الطبقات مع fallback نهائي إلى best
+    # 1) أفضل فيديو ضمن الارتفاع + الصوت المطلوب
+    # 2) أفضل فيديو ضمن الارتفاع + أي صوت
+    # 3) صيغة مدمجة جاهزة ضمن الارتفاع
+    # 4) أي صيغة ضمن الارتفاع
+    # 5) أفضل شيء متاح على الإطلاق (يمنع الفشل نهائياً)
+    selector = (
+        f"bv*[height<={h}]+{audio_part}/"
+        f"bv*[height<={h}]+ba/"
+        f"b[height<={h}]/"
+        f"bv*[height<={h}]/"
+        f"best[height<={h}]/"
+        f"bv*+ba/b/best"
+    )
+    return selector, total
 
 
 def sanitize_name(name):
     if not name:
         return "unnamed"
+    name = str(name)
     for ch in '<>:"/\\|?*':
         name = name.replace(ch, "_")
-    return name[:100].strip().strip(".")
+    # إزالة محارف التحكم
+    name = "".join(c for c in name if ord(c) >= 32)
+    return name[:100].strip().strip(".") or "unnamed"
 
+
+# ================================================================
+# Queue / Status helpers
+# ================================================================
 
 def update_job_status(job_id, status, extra=None):
     queue = read_json(QUEUE_FILE, [])
@@ -462,7 +576,7 @@ def update_job_progress(job_id, percent, status=None, error=None, saved_uri=None
 
 
 # ================================================================
-# FFmpeg Resolver (باستخدام _get_android_context)
+# FFmpeg Resolver
 # ================================================================
 
 _ffmpeg_cached = None
@@ -552,7 +666,44 @@ def ffmpeg_version():
 
 
 # ================================================================
-# Service Logic (باستخدام _get_android_context + ParcelFileDescriptor)
+# yt-dlp options builder (موحّد بين التحليل والتحميل)
+# ================================================================
+
+def _base_ydl_opts():
+    """خيارات yt-dlp أساسية محصّنة ضد الأخطاء الشائعة."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "cachedir": False,
+        "socket_timeout": 30,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
+        "ignoreerrors": False,
+        "retries": 10,
+        "fragment_retries": 10,
+        # تمرير عملاء متعددين لتفادي أخطاء التوقيع/الفورمات (مثل MGV3 InnerTube)
+        "extractor_args": {
+            "youtube": {
+                "player_client": _PLAYER_CLIENTS,
+            }
+        },
+    }
+    return opts
+
+
+def _maybe_add_cookies(opts):
+    """إضافة الكوكيز إن وُجد ملف كوكيز صالح (اختياري)."""
+    try:
+        cookie_file = os.path.join(_BASE, "cookies.txt")
+        if os.path.isfile(cookie_file) and os.path.getsize(cookie_file) > 50:
+            opts["cookiefile"] = cookie_file
+    except Exception:
+        pass
+    return opts
+
+
+# ================================================================
+# Service Logic
 # ================================================================
 
 _wake_lock = None
@@ -676,7 +827,7 @@ def _stop_foreground():
 
 def _init_executor():
     global _executor
-    if _executor is None or getattr(_executor, '_shutdown', False):
+    if _executor is None or getattr(_executor, "_shutdown", False):
         settings = read_settings()
         max_workers = max(1, min(settings.get("max_concurrent", 2), 4))
         _executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="dl_worker")
@@ -722,17 +873,21 @@ def _progress_hook(job_id, d):
 
 
 def _default_format(quality_key):
+    """
+    fallback نهائي لو المهمة أُنشئت بدون format_selector (مثل عناصر القوائم).
+    كلها مرنة وتنتهي بـ best لتفادي أي فشل.
+    """
     mapping = {
-        "audio_low":  "ba[abr<=48]/ba",
-        "audio_high": "ba",
-        "video_144":  "bv[height<=144]+ba/b[height<=144]",
-        "video_240":  "bv[height<=240]+ba/b[height<=240]",
-        "video_360":  "bv[height<=360]+ba/b[height<=360]",
-        "video_480":  "bv[height<=480]+ba/b[height<=480]",
-        "video_720":  "bv[height<=720]+ba/b[height<=720]",
-        "video_1080": "bv[height<=1080]+ba/b[height<=1080]",
+        "audio_low": "worstaudio/bestaudio[abr<=64]/bestaudio/ba/best",
+        "audio_high": "bestaudio/ba/best",
+        "video_144": "bv*[height<=144]+ba/b[height<=144]/best[height<=144]/bv*+ba/b/best",
+        "video_240": "bv*[height<=240]+ba/b[height<=240]/best[height<=240]/bv*+ba/b/best",
+        "video_360": "bv*[height<=360]+ba/b[height<=360]/best[height<=360]/bv*+ba/b/best",
+        "video_480": "bv*[height<=480]+ba/b[height<=480]/best[height<=480]/bv*+ba/b/best",
+        "video_720": "bv*[height<=720]+ba/b[height<=720]/best[height<=720]/bv*+ba/b/best",
+        "video_1080": "bv*[height<=1080]+ba/b[height<=1080]/best[height<=1080]/bv*+ba/b/best",
     }
-    return mapping.get(quality_key, "bv+ba/b")
+    return mapping.get(quality_key, "bv*+ba/b/best")
 
 
 def _download_single_job(job):
@@ -756,19 +911,27 @@ def _download_single_job(job):
     temp_dir = os.path.join(_BASE, "temp", job_id[:12])
     os.makedirs(temp_dir, exist_ok=True)
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "cachedir": False,
+    # selector النهائي: المخزّن مع المهمة، وإلا fallback مرن
+    if format_selector:
+        # نضمن أن للـ selector المخزّن fallback نهائي إلى best
+        if "best" not in format_selector.split("/")[-1]:
+            format_selector = format_selector + "/best"
+        chosen_format = format_selector
+    else:
+        chosen_format = _default_format(quality_key)
+
+    logger.info("Format selector: %s", chosen_format)
+
+    ydl_opts = _base_ydl_opts()
+    _maybe_add_cookies(ydl_opts)
+    ydl_opts.update({
         "noprogress": False,
         "progress_hooks": [lambda d: _progress_hook(job_id, d)],
         "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
-    }
-
-    if format_selector:
-        ydl_opts["format"] = format_selector
-    else:
-        ydl_opts["format"] = _default_format(quality_key)
+        "format": chosen_format,
+        # لو فشل التنسيق المطلوب، لا نرمي استثناء فوراً — نترك fallback يعمل
+        "format_sort": ["res", "ext:mp4:m4a"],
+    })
 
     if ffmpeg_path:
         ydl_opts["ffmpeg_location"] = ffmpeg_path
@@ -782,13 +945,21 @@ def _download_single_job(job):
     else:
         ydl_opts["merge_output_format"] = "mp4"
 
-    # --- التحميل مع retry ---
+    # --- التحميل مع retry + معالجة خطأ الفورمات ---
     max_retries = 3
     downloaded_files = []
+    last_error = None
 
     for attempt in range(1, max_retries + 1):
         try:
             logger.info("Attempt %d/%d for job %s", attempt, max_retries, job_id[:8])
+
+            # في المحاولة الأخيرة نستخدم أبسط selector مضمون
+            if attempt == max_retries and quality_key.startswith("audio_"):
+                ydl_opts["format"] = "bestaudio/best"
+            elif attempt == max_retries:
+                ydl_opts["format"] = "bv*+ba/b/best"
+
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
 
@@ -806,57 +977,120 @@ def _download_single_job(job):
                         downloaded_files.append(fpath)
                         logger.info("✓ Downloaded: %s", fpath)
 
+            # لو لم نجد ملفات عبر info، افحص المجلد المؤقت
+            if not downloaded_files:
+                downloaded_files = _scan_temp_files(temp_dir, quality_key)
+
             if downloaded_files:
                 break
 
-        except Exception as e:
-            err_msg = str(e)
-            if "CANCELLED_BY_USER" in err_msg:
+        except yt_dlp.utils.DownloadError as de:
+            last_error = str(de)
+            logger.warning("✗ Attempt %d DownloadError: %s", attempt, last_error[:150])
+            if "CANCELLED_BY_USER" in last_error:
                 logger.info("Job %s cancelled", job_id[:8])
                 update_job_status(job_id, "cancelled")
                 update_job_progress(job_id, 0, status="cancelled")
                 _cleanup_temp(temp_dir)
                 return
-            elif "PAUSED_BY_USER" in err_msg:
+            if "PAUSED_BY_USER" in last_error:
                 logger.info("Job %s paused", job_id[:8])
                 update_job_status(job_id, "paused")
                 update_job_progress(job_id, 0, status="paused")
                 return
-            else:
-                logger.warning("✗ Attempt %d failed: %s", attempt, err_msg)
-                if attempt < max_retries:
-                    time.sleep(2 ** attempt)
+            # خطأ فورمات: خفّض التنسيق للمحاولة التالية
+            if "Requested format is not available" in last_error or "requested format" in last_error.lower():
+                logger.info("Format not available -> switching to flexible fallback")
+                if quality_key.startswith("audio_"):
+                    ydl_opts["format"] = "bestaudio/best"
                 else:
-                    raise
+                    ydl_opts["format"] = "bv*+ba/b/best"
+            if attempt < max_retries:
+                time.sleep(min(2 ** attempt, 8))
+            else:
+                _fail_job(job_id, last_error, temp_dir)
+                return
+
+        except Exception as e:
+            last_error = str(e)
+            if "CANCELLED_BY_USER" in last_error:
+                update_job_status(job_id, "cancelled")
+                update_job_progress(job_id, 0, status="cancelled")
+                _cleanup_temp(temp_dir)
+                return
+            if "PAUSED_BY_USER" in last_error:
+                update_job_status(job_id, "paused")
+                update_job_progress(job_id, 0, status="paused")
+                return
+            logger.warning("✗ Attempt %d failed: %s", attempt, last_error[:150])
+            if attempt < max_retries:
+                time.sleep(min(2 ** attempt, 8))
+            else:
+                _fail_job(job_id, last_error, temp_dir)
+                return
 
     if not downloaded_files:
-        raise RuntimeError("No files downloaded after all retries")
+        _fail_job(job_id, last_error or "No files downloaded after all retries", temp_dir)
+        return
 
     # --- الحفظ ---
-    update_job_status(job_id, "saving")
-    update_job_progress(job_id, 100, status="saving")
-    _update_notification("جاري الحفظ", title[:30], progress=100)
+    try:
+        update_job_status(job_id, "saving")
+        update_job_progress(job_id, 100, status="saving")
+        _update_notification("جاري الحفظ", title[:30], progress=100)
 
-    saved_path = ""
-    saved_uri = ""
+        saved_path = ""
+        saved_uri = ""
 
-    for src_file in downloaded_files:
-        if storage_uri:
-            saved_uri = _save_to_saf(src_file, title, playlist_name, storage_uri)
-        else:
-            saved_path = _save_to_filesystem(src_file, title, playlist_name)
+        for src_file in downloaded_files:
+            if storage_uri:
+                saved_uri = _save_to_saf(src_file, title, playlist_name, storage_uri) or saved_uri
+            else:
+                saved_path = _save_to_filesystem(src_file, title, playlist_name) or saved_path
 
-    update_job_status(job_id, "finished", {"saved_uri": saved_uri, "saved_path": saved_path})
-    update_job_progress(job_id, 100, status="finished", saved_uri=saved_uri, saved_path=saved_path)
-    append_download_log(f"✓ {title} - {quality_key}")
+        if not saved_uri and not saved_path:
+            _fail_job(job_id, "فشل حفظ الملف في الوجهة", temp_dir)
+            return
+
+        update_job_status(job_id, "finished", {"saved_uri": saved_uri, "saved_path": saved_path})
+        update_job_progress(job_id, 100, status="finished", saved_uri=saved_uri, saved_path=saved_path)
+        append_download_log(f"✓ {title} - {quality_key}")
+        _cleanup_temp(temp_dir)
+        _update_notification("تم التحميل", title[:30], progress=100)
+        logger.info("✓ Job %s completed successfully!", job_id[:8])
+        logger.info("=" * 60)
+    except Exception as e:
+        _fail_job(job_id, f"خطأ أثناء الحفظ: {e}", temp_dir)
+
+
+def _fail_job(job_id, error, temp_dir):
+    """تسجيل فشل المهمة بأمان دون تعطيل الخدمة."""
+    err = (str(error) or "خطأ غير معروف")[:150]
+    logger.error("✗ Job %s failed: %s", job_id[:8], err)
+    update_job_status(job_id, "error", {"error": err})
+    update_job_progress(job_id, 0, status="error", error=err)
+    append_error_log(f"{job_id[:8]}: {err}")
     _cleanup_temp(temp_dir)
-    _update_notification("تم التحميل", title[:30], progress=100)
-    logger.info("✓ Job %s completed successfully!", job_id[:8])
-    logger.info("=" * 60)
+
+
+def _scan_temp_files(temp_dir, quality_key):
+    """فحص المجلد المؤقت عن ملفات ناتجة (احتياطي إن لم يُرجع info المسار)."""
+    result = []
+    try:
+        skip = (".part", ".ytdl", ".tmp")
+        for name in os.listdir(temp_dir):
+            p = os.path.join(temp_dir, name)
+            if os.path.isfile(p) and not name.lower().endswith(skip):
+                result.append(p)
+        # الأكبر أولاً (الملف الرئيسي)
+        result.sort(key=lambda x: os.path.getsize(x) if os.path.exists(x) else 0, reverse=True)
+    except Exception:
+        pass
+    return result
 
 
 def _save_to_saf(src_file, title, playlist_name, storage_uri):
-    """حفظ ملف عبر Android SAF باستخدام ParcelFileDescriptor (طريقة موثوقة)."""
+    """حفظ ملف عبر Android SAF باستخدام ParcelFileDescriptor."""
     if platform != "android":
         return ""
     try:
@@ -869,13 +1103,19 @@ def _save_to_saf(src_file, title, playlist_name, storage_uri):
         DocumentsContract = autoclass("android.provider.DocumentsContract")
 
         tree_uri = Uri.parse(storage_uri)
+        # تحويل tree uri إلى document uri للمجلد الجذر
+        try:
+            root_doc_id = DocumentsContract.getTreeDocumentId(tree_uri)
+            tree_uri = DocumentsContract.buildDocumentUriUsingTree(tree_uri, root_doc_id)
+        except Exception:
+            pass
 
         # إنشاء مجلد قائمة التشغيل لو موجود
         if playlist_name:
             try:
                 folder_uri = DocumentsContract.createDocument(
                     ctx.getContentResolver(), tree_uri,
-                    "vnd.android.document/directory", playlist_name
+                    "vnd.android.document/directory", sanitize_name(playlist_name)
                 )
                 if folder_uri:
                     tree_uri = folder_uri
@@ -884,9 +1124,8 @@ def _save_to_saf(src_file, title, playlist_name, storage_uri):
 
         ext = os.path.splitext(src_file)[1] or ".mp4"
         safe_title = sanitize_name(title)
-        mime_type = "video/mp4" if ext in (".mp4", ".mkv", ".webm") else "audio/mpeg"
+        mime_type = "video/mp4" if ext.lower() in (".mp4", ".mkv", ".webm") else "audio/mpeg"
 
-        # إنشاء الملف
         file_uri = DocumentsContract.createDocument(
             ctx.getContentResolver(), tree_uri, mime_type, safe_title + ext
         )
@@ -894,25 +1133,20 @@ def _save_to_saf(src_file, title, playlist_name, storage_uri):
             logger.error("✗ Failed to create SAF document")
             return ""
 
-        # -----------------------------------------------------------
-        # طريقة موثوقة للكتابة: ParcelFileDescriptor + os.write
-        # (بتجنب مشاكل jnius مع Java OutputStream)
-        # -----------------------------------------------------------
         pfd = ctx.getContentResolver().openFileDescriptor(file_uri, "w")
         if not pfd:
             logger.error("✗ Failed to open ParcelFileDescriptor")
             return ""
 
         try:
-            fd = pfd.getFd()  # raw file descriptor (int)
+            fd = pfd.getFd()
             file_size = os.path.getsize(src_file)
             written = 0
-
             logger.info("SAF save: writing %d bytes to %s", file_size, safe_title)
 
             with open(src_file, "rb") as src:
                 while True:
-                    chunk = src.read(131072)  # 128KB chunks
+                    chunk = src.read(131072)
                     if not chunk:
                         break
                     offset = 0
@@ -983,7 +1217,6 @@ def _process_queue():
     settings = read_settings()
     max_concurrent = settings.get("max_concurrent", 2)
 
-    # قراءة الـ queue كل مرة
     queued_count = sum(1 for j in queue if j.get("status") == "queued")
     if queued_count > 0:
         logger.info("Found %d queued jobs", queued_count)
@@ -1021,7 +1254,7 @@ def _process_queue():
         try:
             exc = future.exception(timeout=0)
             if exc:
-                logger.error("✗ Job %s failed: %s", jid[:8], exc)
+                logger.error("✗ Job %s crashed: %s", jid[:8], exc)
                 update_job_status(jid, "error")
                 update_job_progress(jid, 0, status="error", error=str(exc)[:100])
                 append_error_log(f"{jid[:8]}: {exc}")
@@ -1033,19 +1266,14 @@ def _service_main_loop():
     logger.info("=" * 60)
     logger.info("Service main loop started")
     logger.info("BASE: %s", _BASE)
-    logger.info("Queue file: %s", QUEUE_FILE)
-    logger.info("Queue exists: %s", os.path.isfile(QUEUE_FILE))
     logger.info("=" * 60)
-    
+
     _acquire_wake_lock()
     _init_executor()
 
     ffmpeg_path = ffmpeg_resolve()
     if ffmpeg_path:
         logger.info("✓ ffmpeg: %s", ffmpeg_path)
-        ver = ffmpeg_version()
-        if ver:
-            logger.info("✓ ffmpeg version: %s", ver[:60])
     else:
         logger.warning("✗ ffmpeg not found - merge will fail")
         append_error_log("ffmpeg not found! Video+audio merge will not work.")
@@ -1062,8 +1290,11 @@ def _service_main_loop():
             _shutdown_event.wait(timeout=3.0)
     finally:
         logger.info("Service shutting down...")
-        if _executor and not _executor._shutdown:
-            _executor.shutdown(wait=True, cancel_futures=False)
+        try:
+            if _executor and not getattr(_executor, "_shutdown", False):
+                _executor.shutdown(wait=True, cancel_futures=False)
+        except Exception:
+            pass
         _release_wake_lock()
         _stop_foreground()
         logger.info("Service stopped")
@@ -1205,28 +1436,22 @@ if not IS_SERVICE:
             radius: [dp(14)]
 """
 
-
     class Card(BoxLayout):
         pass
 
-
     class Button3D(Button):
         bg_color = ListProperty([0.20, 0.45, 0.85, 1])
-
 
     class QualityToggle(ToggleButtonBehavior, FloatLayout):
         bg_color = ListProperty([0.26, 0.26, 0.30, 1])
         label_text = StringProperty("")
         size_text = StringProperty("")
 
-
     class DownloadCard(BoxLayout):
         pass
 
-
     Builder.load_string(KV)
     SmallButton3D = Factory.SmallButton3D
-
 
     class YTDownloaderApp(App):
         font_path = FONT_PATH
@@ -1240,7 +1465,10 @@ if not IS_SERVICE:
             self.storage_uri = load_storage_uri()
             self.quality_buttons = []
             self.download_widgets = {}
-            self.quality_data = {}
+            # بيانات الجودات (بديلة للـ quality_data القديمة)
+            self.sorted_audio = []
+            self.video_map = {}
+            self.video_map_high = {}
             self.is_playlist = False
             self.playlist_entries = []
             self.playlist_title = ""
@@ -1453,7 +1681,7 @@ if not IS_SERVICE:
             )
             self.dl_log_label.bind(
                 width=lambda i, w: setattr(i, "text_size", (w, None)),
-                texture_size=lambda i, s: setattr(i, "height", s[1]),
+                texture_size=lambda i, sz: setattr(i, "height", sz[1]),
             )
             dl_scroll.add_widget(self.dl_log_label)
             dl_card.add_widget(dl_scroll)
@@ -1475,7 +1703,7 @@ if not IS_SERVICE:
             )
             self.err_log_label.bind(
                 width=lambda i, w: setattr(i, "text_size", (w, None)),
-                texture_size=lambda i, s: setattr(i, "height", s[1]),
+                texture_size=lambda i, sz: setattr(i, "height", sz[1]),
             )
             er_scroll.add_widget(self.err_log_label)
             er_card.add_widget(er_scroll)
@@ -1520,27 +1748,36 @@ if not IS_SERVICE:
             write_settings(s)
 
         def _copy_log(self, path):
-            Clipboard.copy(read_log(path))
-            self._set_status("تم نسخ السجل")
+            try:
+                Clipboard.copy(read_log(path))
+                self._set_status("تم نسخ السجل")
+            except Exception:
+                self._set_status("تعذر النسخ")
 
         def _refresh_logs(self, dt):
-            if hasattr(self, "dl_log_label"):
-                c = read_log(DOWNLOAD_LOG_FILE)
-                self.dl_log_label.text = ar(c) if c else ar("(فارغ)")
-            if hasattr(self, "err_log_label"):
-                c = read_log(ERROR_LOG_FILE)
-                self.err_log_label.text = ar(c) if c else ar("(فارغ)")
+            try:
+                if hasattr(self, "dl_log_label"):
+                    c = read_log(DOWNLOAD_LOG_FILE)
+                    self.dl_log_label.text = ar(c) if c else ar("(فارغ)")
+                if hasattr(self, "err_log_label"):
+                    c = read_log(ERROR_LOG_FILE)
+                    self.err_log_label.text = ar(c) if c else ar("(فارغ)")
+            except Exception:
+                pass
 
         def _on_reset_downloads(self, *_):
-            queue = read_json(QUEUE_FILE, [])
-            remaining = [j for j in queue if j.get("status") in ("queued", "downloading", "paused")]
-            write_json(QUEUE_FILE, remaining)
-            ids = {j["id"] for j in remaining}
-            sd = read_json(STATUS_FILE, {})
-            write_json(STATUS_FILE, {k: v for k, v in sd.items() if k in ids})
-            clear_log(DOWNLOAD_LOG_FILE)
-            clear_log(ERROR_LOG_FILE)
-            self._set_status("تم تنظيف السجل")
+            try:
+                queue = read_json(QUEUE_FILE, [])
+                remaining = [j for j in queue if j.get("status") in ("queued", "downloading", "paused")]
+                write_json(QUEUE_FILE, remaining)
+                ids = {j["id"] for j in remaining}
+                sd = read_json(STATUS_FILE, {})
+                write_json(STATUS_FILE, {k: v for k, v in sd.items() if k in ids})
+                clear_log(DOWNLOAD_LOG_FILE)
+                clear_log(ERROR_LOG_FILE)
+                self._set_status("تم تنظيف السجل")
+            except Exception as e:
+                self._set_status(f"خطأ: {e}")
 
         def _on_quality_selected(self, btn):
             self.selected_quality_index = btn.quality_index
@@ -1551,96 +1788,87 @@ if not IS_SERVICE:
         def _analyze(self):
             logger.info("=" * 60)
             logger.info("Starting analysis...")
-            
             try:
                 Clock.schedule_once(lambda dt: self._set_btn(self.btn_analyze, ar("جاري التحليل...")))
-                
+
                 url = ""
                 try:
                     url = Clipboard.paste()
-                    logger.info("Clipboard: %s", url[:100] if url else "(empty)")
                 except Exception as e:
                     logger.error("Clipboard failed: %s", e)
                     url = ""
-                
+
                 if not url or not url.strip():
-                    logger.warning("Clipboard is empty")
                     Clock.schedule_once(lambda dt: self._set_status("الحافظة فارغة - انسخ رابط أولاً"))
                     Clock.schedule_once(lambda dt: self._set_btn(self.btn_analyze, ar("التقط الرابط وحلّل")))
                     return
-                
-                url = url.strip()
-                
+
+                url = url.strip().split()[0]
+
                 if not (url.startswith("http://") or url.startswith("https://")):
-                    logger.warning("Invalid URL: %s", url[:50])
                     Clock.schedule_once(lambda dt: self._set_status("الرابط مش صالح - لازم يبدأ بـ http"))
                     Clock.schedule_once(lambda dt: self._set_btn(self.btn_analyze, ar("التقط الرابط وحلّل")))
                     return
-                
+
                 self.picked_url = url
                 logger.info("Analyzing URL: %s", url[:80])
-                
-                probe_opts = {
-                    "quiet": True, "no_warnings": True, "cachedir": False,
-                    "extract_flat": "in_playlist", "noplaylist": False, "socket_timeout": 30,
-                }
-                
-                logger.info("Calling extract_info (probe)...")
+
+                # فحص أولي: قائمة أم فيديو مفرد
+                probe_opts = _base_ydl_opts()
+                probe_opts.update({
+                    "extract_flat": "in_playlist",
+                    "noplaylist": False,
+                })
+
                 try:
                     with YoutubeDL(probe_opts) as ydl:
                         probe = ydl.extract_info(url, download=False)
-                    logger.info("✓ extract_info succeeded")
                 except Exception as e:
-                    logger.error("✗ extract_info failed: %s", e)
+                    logger.error("✗ probe extract_info failed: %s", e)
                     raise
-                
+
                 if not probe:
-                    logger.error("✗ probe is None")
                     Clock.schedule_once(lambda dt: self._set_status("فشل تحليل الرابط"))
                     Clock.schedule_once(lambda dt: self._set_btn(self.btn_analyze, ar("التقط الرابط وحلّل")))
                     return
-                
+
                 if probe.get("_type") == "playlist" or "entries" in probe:
-                    logger.info("Detected: Playlist")
                     self.is_playlist = True
                     self.playlist_entries = [e for e in (probe.get("entries") or []) if e]
                     self.playlist_title = probe.get("title") or "Playlist"
                     self.video_title = self.playlist_title
                     thumbs = probe.get("thumbnails") or []
                     self.video_thumb = thumbs[-1].get("url", "") if thumbs else ""
-                    self.quality_data = {}
+                    self.sorted_audio = []
+                    self.video_map = {}
+                    self.video_map_high = {}
                     logger.info("Playlist: %d videos", len(self.playlist_entries))
                 else:
-                    logger.info("Detected: Single video")
                     self.is_playlist = False
-                    
-                    logger.info("Calling extract_info (full)...")
+                    full_opts = _base_ydl_opts()
+                    full_opts["noplaylist"] = True
                     try:
-                        with YoutubeDL({"quiet": True, "no_warnings": True, "cachedir": False, "noplaylist": True, "socket_timeout": 30}) as y2:
+                        with YoutubeDL(full_opts) as y2:
                             info = y2.extract_info(url, download=False)
-                        logger.info("✓ Full extract succeeded")
                     except Exception as e:
                         logger.error("✗ Full extract failed: %s", e)
                         raise
-                    
+
                     self.video_title = info.get("title", "")
                     self.video_thumb = info.get("thumbnail", "")
-                    sa, vq = analyze_formats(info)
-                    s = read_settings()
-                    self.quality_data = pick_best_options(sa, vq, use_low_audio=bool(s.get("pair_low_audio", True)))
-                    logger.info("✓ Formats analyzed: %d options", len(self.quality_data))
-                
-                logger.info("Scheduling UI update...")
+                    sa, vmap, vmap_high = analyze_formats(info)
+                    self.sorted_audio = sa
+                    self.video_map = vmap
+                    self.video_map_high = vmap_high
+                    logger.info("✓ Formats: %d audio, %d video qualities",
+                                len(sa), len(vmap))
+
                 Clock.schedule_once(lambda dt: self._on_analyze_done())
-                logger.info("✓ Analysis completed successfully!")
-                logger.info("=" * 60)
-                
+                logger.info("✓ Analysis completed!")
+
             except Exception as e:
-                logger.error("=" * 60)
                 logger.error("✗ ANALYSIS FAILED: %s", e)
                 logger.error("Traceback:", exc_info=True)
-                logger.error("=" * 60)
-                
                 error_msg = str(e)[:100]
                 Clock.schedule_once(lambda dt: self._set_status(f"خطأ: {error_msg}"))
                 Clock.schedule_once(lambda dt: self._set_btn(self.btn_analyze, ar("التقط الرابط وحلّل")))
@@ -1655,12 +1883,17 @@ if not IS_SERVICE:
                 self.thumb.size = (0, 0)
                 self.thumb.opacity = 0
 
+            s = read_settings()
+            use_low = bool(s.get("pair_low_audio", True))
+
             for btn in self.quality_buttons:
                 key = btn.quality_key
                 if not self.is_playlist:
-                    opt = self.quality_data.get(key)
-                    if opt:
-                        btn.size_text = f"{opt[1]} MB"
+                    # احسب الحجم والتوفر من البيانات الجديدة
+                    _, size = build_format_selector(key, self.sorted_audio, self.video_map, use_low)
+                    available = self._is_quality_available(key)
+                    if available:
+                        btn.size_text = f"{_fmt_mb(size)} MB" if size else ""
                         btn.disabled = False
                     else:
                         btn.size_text = ar("غير متاح")
@@ -1684,6 +1917,12 @@ if not IS_SERVICE:
 
             self._set_btn(self.btn_analyze, ar("التقط الرابط وحلّل"))
 
+        def _is_quality_available(self, key):
+            """تحقق من توفر الجودة بناءً على البيانات المحلّلة."""
+            if key in ("audio_low", "audio_high"):
+                return bool(self.sorted_audio)
+            return key in self.video_map
+
         def _on_add_to_queue(self, *_):
             if not self.picked_url or not self.video_title:
                 self._set_status("حلّل رابط أولًا")
@@ -1692,18 +1931,23 @@ if not IS_SERVICE:
                 self._set_status("من فضلك اسمح بالوصول للملفات")
                 self._req_storage_perm()
                 return
-            if self.is_playlist:
-                self._enqueue_playlist()
-            else:
-                self._enqueue_single()
+            try:
+                if self.is_playlist:
+                    self._enqueue_playlist()
+                else:
+                    self._enqueue_single()
+            except Exception as e:
+                self._set_status(f"خطأ: {e}")
 
         def _enqueue_single(self):
             key, label = QUALITY_LABELS[self.selected_quality_index]
-            opt = self.quality_data.get(key)
-            if not opt:
+            if not self._is_quality_available(key):
                 self._set_status("الجودة دي مش متاحة")
                 return
-            fmt, size_mb = opt
+
+            s = read_settings()
+            use_low = bool(s.get("pair_low_audio", True))
+            fmt, size = build_format_selector(key, self.sorted_audio, self.video_map, use_low)
 
             active = ("queued", "downloading", "paused", "merging", "saving")
             queue = read_json(QUEUE_FILE, [])
@@ -1719,7 +1963,7 @@ if not IS_SERVICE:
             }
             queue.append(job)
             write_json(QUEUE_FILE, queue)
-            append_download_log(f"{job['title']} ({label}, {size_mb} MB) - queued")
+            append_download_log(f"{job['title']} ({label}, {_fmt_mb(size)} MB) - queued")
             self._start_service()
             self._set_status("تمت الإضافة للتحميل")
 
@@ -1761,6 +2005,7 @@ if not IS_SERVICE:
                 thumbs = entry.get("thumbnails") or []
                 thumb = thumbs[-1].get("url", "") if thumbs else ""
 
+                # لعناصر القائمة نترك format_selector فارغاً ليُبنى fallback مرن وقت التحميل
                 job = {
                     "id": uuid.uuid4().hex, "url": vurl, "title": title, "thumbnail": thumb,
                     "quality_key": key, "format_selector": "",
@@ -1864,36 +2109,39 @@ if not IS_SERVICE:
         }
 
         def _poll_downloads(self, dt):
-            queue = read_json(QUEUE_FILE, [])
-            sd = read_json(STATUS_FILE, {})
-            current_ids = set()
-            has_active = False
+            try:
+                queue = read_json(QUEUE_FILE, [])
+                sd = read_json(STATUS_FILE, {})
+                current_ids = set()
+                has_active = False
 
-            for job in queue:
-                jid = job["id"]
-                current_ids.add(jid)
-                info = sd.get(jid, {})
-                status = info.get("status", job.get("status", "queued"))
-                percent = info.get("percent", 0.0)
-                if status in ("queued", "downloading", "merging", "saving", "paused"):
-                    has_active = True
-                if jid not in self.download_widgets:
-                    self._create_card(job, status, percent, info)
-                else:
-                    self._update_card(jid, job, status, percent, info)
+                for job in queue:
+                    jid = job["id"]
+                    current_ids.add(jid)
+                    info = sd.get(jid, {})
+                    status = info.get("status", job.get("status", "queued"))
+                    percent = info.get("percent", 0.0)
+                    if status in ("queued", "downloading", "merging", "saving", "paused"):
+                        has_active = True
+                    if jid not in self.download_widgets:
+                        self._create_card(job, status, percent, info)
+                    else:
+                        self._update_card(jid, job, status, percent, info)
 
-            for jid in list(self.download_widgets.keys()):
-                if jid not in current_ids:
-                    w = self.download_widgets.pop(jid)
-                    self.downloads_list.remove_widget(w["card"])
+                for jid in list(self.download_widgets.keys()):
+                    if jid not in current_ids:
+                        w = self.download_widgets.pop(jid)
+                        self.downloads_list.remove_widget(w["card"])
 
-            if has_active != self._has_active:
-                self._has_active = has_active
-                if self._poll_event:
-                    self._poll_event.cancel()
-                    self._poll_event = Clock.schedule_interval(
-                        self._poll_downloads, 1.5 if has_active else 5.0
-                    )
+                if has_active != self._has_active:
+                    self._has_active = has_active
+                    if self._poll_event:
+                        self._poll_event.cancel()
+                        self._poll_event = Clock.schedule_interval(
+                            self._poll_downloads, 1.5 if has_active else 5.0
+                        )
+            except Exception as e:
+                logger.debug("poll error: %s", e)
 
         def _create_card(self, job, status, percent, info):
             jid = job["id"]
@@ -1958,6 +2206,9 @@ if not IS_SERVICE:
             elif status == "paused":
                 bp.text = ar("استكمال")
                 bp.disabled = False
+            elif status == "error":
+                bp.text = ar("إعادة")
+                bp.disabled = False
             else:
                 bp.disabled = True
             w["btn_cancel"].disabled = status in ("finished", "cancelled")
@@ -1970,18 +2221,23 @@ if not IS_SERVICE:
 
         def _on_pause(self, jid):
             sd = read_json(STATUS_FILE, {})
-            if sd.get(jid, {}).get("status") == "paused":
+            st = sd.get(jid, {}).get("status")
+            if st in ("paused", "error"):
+                # استئناف / إعادة المحاولة
                 queue = read_json(QUEUE_FILE, [])
                 for j in queue:
                     if j["id"] == jid:
                         j["status"] = "queued"
                 write_json(QUEUE_FILE, queue)
+                update_job_progress(jid, 0, status="queued")
                 self._start_service()
             else:
                 self._send_control(jid, "pause")
 
         def _on_cancel(self, jid):
             self._send_control(jid, "cancel")
+            update_job_status(jid, "cancelled")
+            update_job_progress(jid, 0, status="cancelled")
 
         def _on_open(self, jid):
             sd = read_json(STATUS_FILE, {})
@@ -2022,7 +2278,6 @@ if not IS_SERVICE:
 # ================================================================
 
 def main():
-    """تشغيل التطبيق."""
     if IS_SERVICE:
         logger.info("Running as service...")
         run_service()
@@ -2033,18 +2288,7 @@ def main():
 
 if __name__ == "__main__":
     if IS_SERVICE:
-        logger.info("=" * 60)
-        logger.info("Starting as SERVICE")
-        logger.info("BASE path: %s", _BASE)
-        logger.info("Queue file: %s", QUEUE_FILE)
-        logger.info("=" * 60)
-        
         _create_notification_channel()
         run_service()
     else:
-        logger.info("=" * 60)
-        logger.info("Starting as APP")
-        logger.info("BASE path: %s", _BASE)
-        logger.info("=" * 60)
-        
         main()
